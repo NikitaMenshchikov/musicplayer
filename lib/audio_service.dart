@@ -1,9 +1,12 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:audioplayers/audioplayers.dart' hide AudioPlayer;
 import 'package:file_picker/file_picker.dart';
 import 'package:audiotags/audiotags.dart';
+import 'package:just_audio/just_audio.dart';
 import 'package:musicplayer/database/database_helper.dart';
 import 'package:musicplayer/models/audio_file_model.dart';
+import 'package:musicplayer/utils/path_utils.dart';
 
 class AudioService {
 static final AudioService _instance = AudioService._internal();
@@ -15,6 +18,11 @@ static final AudioService _instance = AudioService._internal();
   final Map<String, Uint8List?> _coverCache = {};
 
   final List<Function(String)> _fileUpdateListeners = [];
+  bool _isDisposed = false;
+  void dispose() {
+    _isDisposed = true;
+    _fileUpdateListeners.clear();
+  }
 
   void addFileUpdateListener(Function(String) listener) {
     _fileUpdateListeners.add(listener);
@@ -25,8 +33,18 @@ static final AudioService _instance = AudioService._internal();
   }
 
   void _notifyFileUpdated(String filePath) {
-    for (final listener in _fileUpdateListeners) {
-      listener(filePath);
+    if (_isDisposed) return;
+    
+    final listeners = List<Function(String)>.from(_fileUpdateListeners);
+    
+    for (final listener in listeners) {
+      try {
+        if (!_isDisposed) {
+          listener(filePath);
+        }
+      } catch (e) {
+        print("Error in file update listener: $e");
+      }
     }
   }
 
@@ -54,41 +72,138 @@ static final AudioService _instance = AudioService._internal();
     }
   }
 
-  Future<void> _processAudioFile(PlatformFile platformFile) async {
-    final filePath = platformFile.path!;
-    
-    var existingFile = await _databaseHelper.getAudioFileByPath(filePath);
-    
-    if (existingFile == null) {
-      final tag = await _loadMetadataFromFile(filePath);
-      final duration = await _getAudioDuration(filePath);
+Future<void> _processAudioFile(PlatformFile platformFile) async {
+  final tempPath = platformFile.path!;
+  final fileName = platformFile.name;
+  
+  print("Обработка файла: $fileName");
+  print("Временный путь: $tempPath");
+  
+  String? permanentPath = await PathUtils.findOriginalPath(tempPath, fileName);
+  
+  if (permanentPath == null) {
+    print("Не найден оригинальный файл для: $fileName");
+    permanentPath = tempPath;
+  } else {
+    print("Найден оригинальный путь: $permanentPath");
+  }
+  
+  var existingFile = await _databaseHelper.getAudioFileByPath(permanentPath);
+  
+  if (existingFile != null) {
+    print("Файл уже в базе: $fileName");
+    return;
+  }
+  
+  final tag = await _loadMetadataFromFile(permanentPath);
+  final duration = await _getAudioDuration(permanentPath);
+  
+  final audioFileModel = AudioFileModel(
+    filePath: permanentPath,  
+    fileName: platformFile.name,
+    title: tag?.title,
+    artist: tag?.trackArtist,
+    album: tag?.album,
+    genre: tag?.genre,
+    year: tag?.year,
+    trackNumber: tag?.trackNumber,
+    fileSize: platformFile.size,
+    fileExtension: platformFile.extension ?? 'unknown',
+    duration: duration?.inMilliseconds ?? 0,
+    dateAdded: DateTime.now(),
+  );
+  
+  await _databaseHelper.insertAudioFile(audioFileModel);
+  print("Файл добавлен в БД: $fileName");
+}
+
+Future<void> migrateTempPathsToPermanent() async {
+  print("Начинаем миграцию временных путей...");
+  
+  final files = await _databaseHelper.getAudioFiles();
+  int migratedCount = 0;
+  int failedCount = 0;
+  
+  for (final file in files) {
+    if (PathUtils.isTemporaryPath(file.filePath)) {
+      print("Найден временный путь: ${file.filePath}");
       
-      final audioFileModel = AudioFileModel(
-        filePath: filePath,
-        fileName: platformFile.name,
-        title: tag?.title,
-        artist: tag?.trackArtist,
-        album: tag?.album,
-        genre: tag?.genre,
-        year: tag?.year,
-        trackNumber: tag?.trackNumber,
-        fileSize: platformFile.size,
-        fileExtension: platformFile.extension ?? 'unknown',
-        duration: duration?.inMilliseconds ?? 0,
-        dateAdded: DateTime.now(),
+      final originalPath = await PathUtils.findOriginalPath(
+        file.filePath, 
+        file.fileName
       );
       
-      await _databaseHelper.insertAudioFile(audioFileModel);
-      
-      if (tag != null) {
-        _metadataCache[filePath] = tag;
-        _updateCoverCache(filePath, tag.pictures);
+      if (originalPath != null && originalPath != file.filePath) {
+        try {
+          final updatedFile = AudioFileModel(
+            id: file.id,
+            filePath: originalPath,
+            fileName: file.fileName,
+            title: file.title,
+            artist: file.artist,
+            album: file.album,
+            genre: file.genre,
+            year: file.year,
+            trackNumber: file.trackNumber,
+            fileSize: file.fileSize,
+            fileExtension: file.fileExtension,
+            duration: file.duration,
+            dateAdded: file.dateAdded,
+          );
+          
+          await _databaseHelper.updateAudioFile(updatedFile);
+          migratedCount++;
+          print("Мигрирован: ${file.fileName}");
+        } catch (e) {
+          failedCount++;
+          print("Ошибка миграции ${file.fileName}: $e");
+        }
+      } else {
+        print("Оригинал не найден для: ${file.fileName}");
+        failedCount++;
       }
-    } else {
-      await _loadMetadataFromFile(filePath);
     }
   }
+  
+  print("Миграция завершена!");
+  print("Успешно: $migratedCount, Не удалось: $failedCount");
+}
 
+Future<void> updateAudioFilePath(int id, String newFilePath) async {
+  try {
+    final files = await _databaseHelper.getAudioFiles();
+    final file = files.firstWhere((f) => f.id == id);
+    
+    final updatedFile = AudioFileModel(
+      id: file.id,
+      filePath: newFilePath,
+      fileName: file.fileName,
+      title: file.title,
+      artist: file.artist,
+      album: file.album,
+      genre: file.genre,
+      year: file.year,
+      trackNumber: file.trackNumber,
+      fileSize: file.fileSize,
+      fileExtension: file.fileExtension,
+      duration: file.duration,
+      dateAdded: file.dateAdded,
+    );
+    
+    await _databaseHelper.updateAudioFile(updatedFile);
+    
+    clearFileCache(newFilePath);
+    print("Обновлен путь файла: ${file.fileName} -> $newFilePath");
+  } catch (e) {
+    print("Ошибка обновления пути файла: $e");
+    rethrow;
+  }
+}
+
+Future<String?> _tryGetOriginalPath(String filePickerPath) async {
+
+  return null; 
+}
   Future<Tag?> _loadMetadataFromFile(String filePath) async {
     try {
       final tag = await AudioTags.read(filePath);
@@ -114,14 +229,63 @@ static final AudioService _instance = AudioService._internal();
     }
   }
 
-  Future<Duration?> _getAudioDuration(String filePath) async {
+Future<Duration?> _getAudioDuration(String filePath) async {
+  try {
+    final player = AudioPlayer();
+    
     try {
-      return Duration.zero;
+      await player.setAudioSource(AudioSource.uri(Uri.file(filePath)));
+      
+      final duration = player.duration;
+      
+      await player.dispose();
+      
+      print("Duration for $filePath: $duration");
+      return duration ?? Duration.zero;
     } catch (e) {
-      print("Error getting audio duration for $filePath: $e");
-      return null;
+      print("Error getting duration with just_audio: $e");
+      await player.dispose();
+      return Duration.zero;
     }
+  } catch (e) {
+    print("Error getting audio duration for $filePath: $e");
+    return Duration.zero;
   }
+}
+
+Future<void> recalculateDurations() async {
+  try {
+    final files = await _databaseHelper.getAudioFiles();
+    
+    for (final file in files) {
+      if (file.duration <= 0) {
+        final newDuration = await _getAudioDuration(file.filePath);
+        if (newDuration != null && newDuration.inMilliseconds > 0) {
+          final updatedFile = AudioFileModel(
+            id: file.id,
+            filePath: file.filePath,
+            fileName: file.fileName,
+            title: file.title,
+            artist: file.artist,
+            album: file.album,
+            genre: file.genre,
+            year: file.year,
+            trackNumber: file.trackNumber,
+            fileSize: file.fileSize,
+            fileExtension: file.fileExtension,
+            duration: newDuration.inMilliseconds,
+            dateAdded: file.dateAdded,
+          );
+          
+          await _databaseHelper.updateAudioFile(updatedFile);
+          print("Updated duration for ${file.fileName}: $newDuration");
+        }
+      }
+    }
+  } catch (e) {
+    print("Error recalculating durations: $e");
+  }
+}
 
   Future<List<AudioFileModel>> getAudioFiles() async {
     return await _databaseHelper.getAudioFiles();
@@ -184,7 +348,7 @@ Future<void> updateMetadata(String filePath, Tag newMetadata, {List<Picture>? pi
     }
     
     _notifyMetadataUpdated(filePath);
-          _notifyFileUpdated(filePath);
+    _notifyFileUpdated(filePath); 
 
   } catch (e) {
     print("Error updating metadata for $filePath: $e");
@@ -223,8 +387,7 @@ Future<void> refreshFileData(String filePath) async {
   }
   
   _notifyMetadataUpdated(filePath);
-      _notifyFileUpdated(filePath);
-
+  _notifyFileUpdated(filePath); 
 }
 
 Future<void> forceRefreshMetadata(String filePath) async {
@@ -233,6 +396,51 @@ Future<void> forceRefreshMetadata(String filePath) async {
   
   await _loadMetadataFromFile(filePath);
 }
+
+  Future<List<AudioFileModel>> getAudioFilesWithRefresh() async {
+    try {
+      final files = await _databaseHelper.getAudioFiles();
+      
+      final updatedFiles = <AudioFileModel>[];
+      
+      for (final file in files) {
+        try {
+          await _loadMetadataFromFile(file.filePath);
+          final tag = _metadataCache[file.filePath];
+          
+          if (tag != null) {
+            final updatedFile = AudioFileModel(
+              id: file.id,
+              filePath: file.filePath,
+              fileName: file.fileName,
+              title: tag.title,
+              artist: tag.trackArtist,
+              album: tag.album,
+              genre: tag.genre,
+              year: tag.year,
+              trackNumber: tag.trackNumber,
+              fileSize: file.fileSize,
+              fileExtension: file.fileExtension,
+              duration: file.duration,
+              dateAdded: file.dateAdded,
+            );
+            updatedFiles.add(updatedFile);
+          } else {
+            updatedFiles.add(file);
+          }
+        } catch (e) {
+          print("Error refreshing metadata for ${file.fileName}: $e");
+          updatedFiles.add(file);
+        }
+      }
+      
+      return updatedFiles;
+    } catch (e) {
+      print("Error getting audio files with refresh: $e");
+      return await _databaseHelper.getAudioFiles();
+    }
+  }
+
   
 
   Future<List<String>> getArtists() async {

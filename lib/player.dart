@@ -5,7 +5,8 @@ import 'package:audiotags/audiotags.dart';
 import 'package:musicplayer/edit_tags_dialog.dart';
 import 'package:musicplayer/models/audio_file_model.dart';
 import 'package:musicplayer/audio_service.dart';
-import 'package:musicplayer/audio_player_service.dart';
+import 'package:musicplayer/player_state_service.dart';
+import 'package:provider/provider.dart';
 
 class SimpleExampleApp extends StatefulWidget {
   final AudioFileModel audioFile;
@@ -17,71 +18,68 @@ class SimpleExampleApp extends StatefulWidget {
 
 class SimpleExampleAppState extends State<SimpleExampleApp> {
   final AudioService _audioService = AudioService();
-  final AudioPlayerService _playerService = AudioPlayerService();
   Tag? metadata;
   Uint8List? albumArt;
   bool isLoadingMetadata = true;
-  
-  bool _isPlaying = false;
-  Duration _position = Duration.zero;
-  Duration _duration = Duration.zero;
-  bool _playerReady = false;
   bool _isSeeking = false;
+  List<AudioFileModel> _allAudioFiles = [];
+  PlayerStateService? _playerState; 
+  AudioFileModel? _currentAudioFile; 
 
   @override
   void initState() {
     super.initState();
+    _currentAudioFile = widget.audioFile;
     _loadMetadata();
-    _setupPlayerListeners();
+    _loadAllAudioFiles();
+    _setupPlayerStateListeners();
     
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_playerService.isInitialized) {
-        _playerReady = true;
-        _playCurrentFile();
-      } else {
-        _playerService.init();
-        _playerReady = true;
-        _playCurrentFile();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final playerState = Provider.of<PlayerStateService>(context, listen: false);
+      _playerState = playerState; 
+      if (playerState.currentPlayingFile?.filePath != _currentAudioFile!.filePath) {
+        await playerState.playAudioFile(_currentAudioFile!);
       }
     });
   }
 
-  void _setupPlayerListeners() {
-    _playerService.addPlaybackListener((isPlaying) {
-      if (mounted) {
-        setState(() {
-          _isPlaying = isPlaying;
-        });
-      }
-    });
+  Future<void> _loadAllAudioFiles() async {
+    try {
+      _allAudioFiles = await _audioService.getAudioFiles();
+    } catch (e) {
+      print("Error loading audio files: $e");
+    }
+  }
 
-    _playerService.addPositionListener((position) {
-      if (mounted && !_isSeeking) {
-        setState(() {
-          _position = position;
-        });
-      }
-    });
+  void _setupPlayerStateListeners() {
+    final playerState = Provider.of<PlayerStateService>(context, listen: false);
+    _playerState = playerState;
+    playerState.addListener(_onPlayerStateChanged);
+  }
 
-    _playerService.addDurationListener((duration) {
-      if (mounted) {
-        setState(() {
-          _duration = duration;
-        });
+    void _onPlayerStateChanged() {
+    if (mounted) {
+      final currentFile = _playerState?.currentPlayingFile;
+      if (currentFile != null && currentFile.filePath != _currentAudioFile?.filePath) {
+        _currentAudioFile = currentFile;
+        _loadMetadata();
       }
-    });
+      setState(() {});
+    }
   }
 
   Future<void> _loadMetadata() async {
     try {
-      await _audioService.forceRefreshMetadata(widget.audioFile.filePath);
-      metadata = await _audioService.getMetadata(widget.audioFile.filePath);
-      albumArt = await _audioService.getCover(widget.audioFile.filePath);
-      
-      if (mounted) {
-        setState(() {
-          isLoadingMetadata = false;
-        });
+      if (_currentAudioFile != null) {
+        await _audioService.forceRefreshMetadata(_currentAudioFile!.filePath);
+        metadata = await _audioService.getMetadata(_currentAudioFile!.filePath);
+        albumArt = await _audioService.getCover(_currentAudioFile!.filePath);
+        
+        if (mounted) {
+          setState(() {
+            isLoadingMetadata = false;
+          });
+        }
       }
     } catch (e) {
       print("Error loading metadata in player: $e");
@@ -93,62 +91,21 @@ class SimpleExampleAppState extends State<SimpleExampleApp> {
     }
   }
 
-  Future<void> _playCurrentFile() async {
-    if (!_playerReady) {
-      print("Player not ready yet");
-      return;
-    }
-
-    try {
-      await _playerService.playAudioFile(widget.audioFile);
-      
-      Future.delayed(Duration(seconds: 1), () {
-        if (mounted && _duration == Duration.zero) {
-          _playerService.refreshDuration();
-        }
-      });
-    } catch (e) {
-      print("Ошибка воспроизведения: $e");
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Ошибка воспроизведения файла: $e')),
-        );
-      }
-    }
-  }
-
   Future<void> _togglePlayPause() async {
-    if (!_playerReady) return;
-
-    if (_isPlaying) {
-      await _playerService.pause();
-    } else {
-      if (_playerService.currentAudioFile?.filePath == widget.audioFile.filePath) {
-        await _playerService.resume();
-      } else {
-        await _playCurrentFile();
-      }
-    }
+    await _playerState?.togglePlayPause();
   }
 
   Future<void> _stopFile() async {
-    if (!_playerReady) return;
-    await _playerService.stop();
+    await _playerState?.stop();
   }
 
   Future<void> _seekTo(Duration position) async {
-    if (!_playerReady) return;
-    
     setState(() {
       _isSeeking = true;
     });
     
     try {
-      await _playerService.seek(position);
-      
-      setState(() {
-        _position = position;
-      });
+      await _playerState?.seek(position);
     } catch (e) {
       print("Error seeking: $e");
     } finally {
@@ -158,30 +115,58 @@ class SimpleExampleAppState extends State<SimpleExampleApp> {
     }
   }
 
-Future<void> _editTags() async {
-  if (metadata == null) return;
-
-  final result = await showDialog<bool>(
-    context: context,
-    builder: (context) => EditTagsDialog(
-      initialMetadata: metadata!,
-      filePath: widget.audioFile.filePath,
-    ),
-  );
-
-  if (result == true) {
-    final audioService = AudioService();
-    await audioService.refreshFileData(widget.audioFile.filePath);
+  Future<void> _playNextTrack() async {
+    if (_allAudioFiles.isEmpty || _playerState?.currentPlayingFile == null) return;
     
-    await _loadMetadata();
+    final currentIndex = _allAudioFiles.indexWhere(
+      (file) => file.filePath == _playerState!.currentPlayingFile!.filePath
+    );
     
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Теги успешно обновлены!')),
-      );
+    if (currentIndex != -1) {
+      final nextIndex = (currentIndex + 1) % _allAudioFiles.length;
+      final nextFile = _allAudioFiles[nextIndex];
+      await _playerState!.playAudioFile(nextFile);
     }
   }
-}
+
+  Future<void> _playPreviousTrack() async {
+    if (_allAudioFiles.isEmpty || _playerState?.currentPlayingFile == null) return;
+    
+    final currentIndex = _allAudioFiles.indexWhere(
+      (file) => file.filePath == _playerState!.currentPlayingFile!.filePath
+    );
+    
+    if (currentIndex != -1) {
+      final prevIndex = currentIndex == 0 ? _allAudioFiles.length - 1 : currentIndex - 1;
+      final prevFile = _allAudioFiles[prevIndex];
+      await _playerState!.playAudioFile(prevFile);
+    }
+  }
+
+  Future<void> _editTags() async {
+    if (metadata == null) return;
+
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) => EditTagsDialog(
+        initialMetadata: metadata!,
+        filePath: widget.audioFile.filePath,
+      ),
+    );
+
+    if (result == true) {
+      final audioService = AudioService();
+      await audioService.refreshFileData(widget.audioFile.filePath);
+      
+      await _loadMetadata();
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Теги успешно обновлены!')),
+        );
+      }
+    }
+  }
 
   String _formatDuration(Duration duration) {
     String twoDigits(int n) => n.toString().padLeft(2, '0');
@@ -192,43 +177,41 @@ Future<void> _editTags() async {
 
   @override
   void dispose() {
-    _playerService.removePlaybackListener((_) {});
-    _playerService.removePositionListener((_) {});
-    _playerService.removeDurationListener((_) {});
+    _playerState?.removeListener(_onPlayerStateChanged);
     super.dispose();
   }
 
   String getTitle() {
-    if (isLoadingMetadata) return widget.audioFile.fileName;
-    return metadata?.title ?? widget.audioFile.title ??
+    if (isLoadingMetadata) return _currentAudioFile?.fileName ?? '';
+    return metadata?.title ?? _currentAudioFile?.title ??
            _getFileNameWithoutExtension();
   }
 
   String _getFileNameWithoutExtension() {
-    return widget.audioFile.fileName.replaceAll(
+    return _currentAudioFile?.fileName.replaceAll(
       RegExp(r'\.(mp3|wav|aac|m4a|ogg|flac)$', caseSensitive: false), 
       ''
-    );
+    ) ?? '';
   }
 
   String getArtist() {
     if (isLoadingMetadata) return 'Загрузка...';
-    return metadata?.trackArtist ?? widget.audioFile.artist ?? 'Неизвестный исполнитель';
+    return metadata?.trackArtist ?? _currentAudioFile?.artist ?? 'Неизвестный исполнитель';
   }
 
   String getAlbum() {
     if (isLoadingMetadata) return '';
-    return metadata?.album ?? widget.audioFile.album ?? 'Неизвестный альбом';
+    return metadata?.album ?? _currentAudioFile?.album ?? 'Неизвестный альбом';
   }
 
   String? getYear() {
     if (isLoadingMetadata) return null;
-    return metadata?.year?.toString() ?? (widget.audioFile.year?.toString());
+    return metadata?.year?.toString() ?? (_currentAudioFile?.year?.toString());
   }
 
   String? getGenre() {
     if (isLoadingMetadata) return null;
-    return metadata?.genre ?? widget.audioFile.genre;
+    return metadata?.genre ?? _currentAudioFile?.genre;
   }
 
   Widget _buildAlbumArt() {
@@ -270,9 +253,11 @@ Future<void> _editTags() async {
   }
 
   Widget _buildPlayPauseButton() {
+    final isPlaying = _playerState?.isPlaying ?? false;
+    
     return IconButton(
       icon: Icon(
-        _isPlaying ? Icons.pause : Icons.play_arrow,
+        isPlaying ? Icons.pause : Icons.play_arrow,
         size: 48,
         color: Colors.green,
       ),
@@ -281,10 +266,13 @@ Future<void> _editTags() async {
   }
 
   Widget _buildProgressBar() {
-    final maxDuration = _duration.inSeconds.toDouble();
-    final currentPosition = _position.inSeconds.toDouble();
+    final position = _playerState?.position ?? Duration.zero;
+    final duration = _playerState?.duration ?? Duration.zero;
+    
+    final maxDuration = duration.inSeconds.toDouble();
+    final currentPosition = position.inSeconds.toDouble();
 
-    if (maxDuration == 0) {
+    if (maxDuration == 0 || duration == Duration.zero) {
       return Column(
         children: [
           LinearProgressIndicator(),
@@ -294,7 +282,7 @@ Future<void> _editTags() async {
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(_formatDuration(_position)),
+                Text(_formatDuration(position)),
                 Text('--:--'),
               ],
             ),
@@ -310,9 +298,6 @@ Future<void> _editTags() async {
           max: maxDuration,
           value: currentPosition.clamp(0, maxDuration),
           onChanged: (value) {
-            setState(() {
-              _position = Duration(seconds: value.toInt());
-            });
           },
           onChangeEnd: (value) {
             _seekTo(Duration(seconds: value.toInt()));
@@ -323,8 +308,8 @@ Future<void> _editTags() async {
           child: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(_formatDuration(_position)),
-              Text(_formatDuration(_duration)),
+              Text(_formatDuration(position)),
+              Text(_formatDuration(duration)),
             ],
           ),
         ),
@@ -366,14 +351,6 @@ Future<void> _editTags() async {
                         Text('Загрузка метаданных...'),
                       ],
                     )
-                  else if (!_playerReady)
-                    Column(
-                      children: [
-                        CircularProgressIndicator(),
-                        SizedBox(height: 16),
-                        Text('Инициализация плеера...'),
-                      ],
-                    )
                   else
                     Column(
                       children: [
@@ -399,11 +376,7 @@ Future<void> _editTags() async {
       children: [
         IconButton(
           icon: Icon(Icons.skip_previous, size: 32, color: Colors.blue),
-          onPressed: () {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Переход к предыдущему треку')),
-            );
-          },
+          onPressed: _playPreviousTrack, 
         ),
         SizedBox(width: 20),
         IconButton(
@@ -413,16 +386,11 @@ Future<void> _editTags() async {
         SizedBox(width: 20),
         IconButton(
           icon: Icon(Icons.skip_next, size: 32, color: Colors.blue),
-          onPressed: () {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Переход к следующему треку')),
-            );
-          },
+          onPressed: _playNextTrack, 
         ),
       ],
     );
   }
-
 
   Widget _buildMetadataCard() {
     final title = getTitle();

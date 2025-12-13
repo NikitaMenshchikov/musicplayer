@@ -1,8 +1,12 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:audiotags/audiotags.dart';
+import 'package:permission_handler/permission_handler.dart'; 
+import 'package:url_launcher/url_launcher.dart'; 
+
 
 class EditTagsDialog extends StatefulWidget {
   final Tag? initialMetadata;
@@ -51,6 +55,185 @@ class _EditTagsDialogState extends State<EditTagsDialog> {
     _trackNumberController = TextEditingController(text: widget.initialMetadata?.trackNumber?.toString() ?? '');
     
     _initCurrentCover();
+  }
+
+  Future<bool> _checkAndRequestPermissions() async {
+    if (!Platform.isAndroid) return true;
+
+    try {
+      final androidInfo = await DeviceInfoPlugin().androidInfo;
+      
+      if (androidInfo.version.sdkInt >= 30) {
+        
+        if (await Permission.manageExternalStorage.isGranted) {
+          return true;
+        }
+        
+        final status = await Permission.manageExternalStorage.request();
+        
+        if (status.isGranted) {
+          return true;
+        }
+        
+        if (mounted) {
+          _showManageExternalStorageDialog();
+        }
+        
+        return false;
+      } else {
+        if (await Permission.storage.isGranted) {
+          return true;
+        }
+        
+        final status = await Permission.storage.request();
+        return status.isGranted;
+      }
+    } catch (e) {
+      print("Error checking permissions: $e");
+      return false;
+    }
+  }
+
+Future<void> _openManageFilesSettings() async {
+    try {
+      if (Platform.isAndroid) {
+        final androidInfo = await DeviceInfoPlugin().androidInfo;
+        
+        if (androidInfo.version.sdkInt >= 30) {
+          final packageName = 'com.yourdomain.musicplayer'; 
+          
+          final uri = Uri.parse('package:$packageName');
+          
+          try {
+            await launchUrl(uri, mode: LaunchMode.externalApplication);
+          } catch (e) {
+            print("Error launching settings: $e");
+            await openAppSettings();
+          }
+        } else {
+          await openAppSettings();
+        }
+      } else {
+        await openAppSettings();
+      }
+    } catch (e) {
+      print("Error opening settings: $e");
+      await openAppSettings();
+    }
+  }
+
+  void _showManageExternalStorageDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: Text('Требуется доступ к файлам'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.folder_open, size: 48, color: Colors.blue),
+            SizedBox(height: 16),
+            Text(
+              'Для сохранения тегов требуется разрешение "Управление всеми файлами".',
+              textAlign: TextAlign.center,
+            ),
+            SizedBox(height: 12),
+            Container(
+              padding: EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.blue.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.blue.shade100),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Как включить доступ:'),
+                  SizedBox(height: 8),
+                  Row(
+                    children: [
+                      Icon(Icons.arrow_right, size: 16, color: Colors.blue),
+                      SizedBox(width: 4),
+                      Expanded(child: Text('Нажмите "Открыть настройки"')),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      Icon(Icons.arrow_right, size: 16, color: Colors.blue),
+                      SizedBox(width: 4),
+                      Expanded(child: Text('Найдите "Файлы и медиа" или "Хранилище"')),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      Icon(Icons.arrow_right, size: 16, color: Colors.blue),
+                      SizedBox(width: 4),
+                      Expanded(child: Text('Выберите "Разрешить управление всеми файлами"')),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      Icon(Icons.arrow_right, size: 16, color: Colors.blue),
+                      SizedBox(width: 4),
+                      Expanded(child: Text('Включите переключатель')),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      Icon(Icons.arrow_right, size: 16, color: Colors.blue),
+                      SizedBox(width: 4),
+                      Expanded(child: Text('Вернитесь в приложение')),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(height: 12),
+            Text(
+              'После включения разрешения, вернитесь и попробуйте сохранить теги снова.',
+              style: TextStyle(
+                fontSize: 12,
+                color: Colors.grey.shade600,
+                fontStyle: FontStyle.italic,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text('Отмена'),
+          ),
+          ElevatedButton.icon(
+            onPressed: () async {
+              Navigator.pop(context);
+              await _openManageFilesSettings();
+              
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('Включите разрешение и вернитесь в приложение'),
+                    duration: Duration(seconds: 3),
+                    action: SnackBarAction(
+                      label: 'Я включил',
+                      onPressed: () {
+                      },
+                    ),
+                  ),
+                );
+              }
+            },
+            icon: Icon(Icons.settings),
+            label: Text('Открыть настройки'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blue,
+              foregroundColor: Colors.white,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _initCurrentCover() async {
@@ -123,18 +306,51 @@ class _EditTagsDialogState extends State<EditTagsDialog> {
   }
 
   Future<void> _saveTags() async {
-    if (_isSaving || !_formKey.currentState!.validate()) return;
+  if (_isSaving || !_formKey.currentState!.validate()) return;
 
-    setState(() {
-      _isSaving = true;
-    });
+  if (mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Проверка разрешений...'),
+        duration: Duration(seconds: 1),
+      ),
+    );
+  }
+
+  final hasPermissions = await _checkAndRequestPermissions();
+  if (!hasPermissions) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Недостаточно прав для сохранения тегов'),
+          backgroundColor: Colors.orange,
+        ),
+      );
+    }
+    return;
+  }
+
+  setState(() {
+    _isSaving = true;
+  });
+
 
     try {
       int? yearValue;
       if (_yearController.text.isNotEmpty) {
         final yearInt = int.tryParse(_yearController.text);
-        if (yearInt != null && yearInt > 0) {
+        if (yearInt == null || yearInt <= 0) {
+          yearValue = null;
+        } else {
           yearValue = yearInt;
+        }
+      }
+
+      String? year = widget.initialMetadata?.year?.toString();
+      if (year != null) {
+        final yearInt = int.tryParse(year);
+        if (yearInt == null || yearInt <= 0) {
+          year = null;
         }
       }
 
@@ -144,34 +360,57 @@ class _EditTagsDialogState extends State<EditTagsDialog> {
         album: _albumController.text.isNotEmpty ? _albumController.text : null,
         genre: _genreController.text.isNotEmpty ? _genreController.text : null,
         year: yearValue,
-        trackNumber: _trackNumberController.text.isNotEmpty ? int.tryParse(_trackNumberController.text) : null, pictures: [            Picture(
-              bytes: _selectedCover!,
-              mimeType: _getMimeType(_selectedCover!),
-              pictureType: PictureType.coverFront,
-            )],
+        trackNumber: _trackNumberController.text.isNotEmpty ? int.tryParse(_trackNumberController.text) : null, 
+        
+        pictures: _selectedCover != null && _selectedCover!.isNotEmpty
+            ? [Picture(
+                bytes: _selectedCover!,
+                mimeType: _getMimeType(_selectedCover!) ?? MimeType.jpeg,
+                pictureType: PictureType.coverFront,
+              )]
+            : [],
       );
 
       print("Saving tags to: ${widget.filePath}");
 
       await AudioTags.write(
         widget.filePath,
-        updatedTag      );
+        updatedTag      
+      );
 
       await Future.delayed(Duration(milliseconds: 500));
 
-      Navigator.of(context).pop(true);
-    } catch (e) {
-      print("Error saving tags: $e");
+      if (mounted) {
+        Navigator.of(context).pop(true);
+      }
+  } catch (e) {
+    print("Error saving tags: $e");
+    
+    if (e.toString().contains('Permission denied') || 
+        e.toString().contains('code: 13') ||
+        e.toString().contains('EACCES')) {
+      if (mounted) {
+        _showManageExternalStorageDialog();
+      }
+    } else {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Ошибка сохранения тегов: $e')),
+          SnackBar(
+            content: Text('Ошибка сохранения тегов: ${e.toString()}'),
+            backgroundColor: Colors.red,
+          ),
         );
       }
+    }
+    
+    if (mounted) {
       setState(() {
         _isSaving = false;
       });
     }
   }
+}
+
 
   MimeType? _getMimeType(Uint8List bytes) {
     if (bytes.length >= 3) {

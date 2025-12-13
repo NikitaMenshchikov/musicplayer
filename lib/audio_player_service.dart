@@ -24,6 +24,8 @@ class AudioPlayerService {
   final List<Function(bool)> _playbackListeners = [];
   final List<Function(Duration)> _positionListeners = [];
   final List<Function(Duration)> _durationListeners = [];
+  final List<Function()> _completionListeners = [];
+  
 
   void init() {
     if (_isInitialized) return;
@@ -51,6 +53,7 @@ class AudioPlayerService {
       _position = Duration.zero;
       _notifyPlaybackListeners();
       _notifyPositionListeners();
+      _notifyCompletionListeners(); 
     });
 
     _isInitialized = true;
@@ -148,6 +151,14 @@ class AudioPlayerService {
     _durationListeners.remove(listener);
   }
 
+  void addCompletionListener(Function() listener) {
+    _completionListeners.add(listener);
+  }
+
+  void removeCompletionListener(Function() listener) {
+    _completionListeners.remove(listener);
+  }
+
   void _notifyPlaybackListeners() {
     for (final listener in _playbackListeners) {
       listener(_isPlaying);
@@ -166,6 +177,12 @@ class AudioPlayerService {
     }
   }
 
+  void _notifyCompletionListeners() {
+    for (final listener in _completionListeners) {
+      listener();
+    }
+  }
+
   void dispose() {
     if (_isInitialized) {
       _player.dispose();
@@ -173,6 +190,7 @@ class AudioPlayerService {
     _playbackListeners.clear();
     _positionListeners.clear();
     _durationListeners.clear();
+    _completionListeners.clear();
     _isInitialized = false;
   }
 }

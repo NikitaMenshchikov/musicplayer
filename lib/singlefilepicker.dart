@@ -1,11 +1,18 @@
+import 'dart:io';
 import 'dart:typed_data';
-import 'package:file_picker/file_picker.dart';
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:musicplayer/player.dart';
 import 'package:musicplayer/edit_tags_dialog.dart';
 import 'package:musicplayer/models/audio_file_model.dart';
 import 'package:musicplayer/audio_service.dart';
-import 'package:musicplayer/audio_player_service.dart';
+import 'package:provider/provider.dart';
+import 'package:musicplayer/player_state_service.dart';
+import 'package:path/path.dart' as path;
+import 'package:permission_handler/permission_handler.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:logger/logger.dart';
 
 class Singlefilepicker extends StatefulWidget {
   const Singlefilepicker({super.key});
@@ -16,140 +23,149 @@ class Singlefilepicker extends StatefulWidget {
 
 class _SinglefilepickerState extends State<Singlefilepicker> {
   final AudioService _audioService = AudioService();
-  final AudioPlayerService _playerService = AudioPlayerService();
+  final Logger _logger = Logger();
+  
   List<AudioFileModel> _audioFiles = [];
   bool isLoading = false;
   bool _isInitialized = false;
-  
-  bool _isPlaying = false;
-  Duration _position = Duration.zero;
-  Duration _duration = Duration.zero;
-  AudioFileModel? _currentPlayingFile;
-  Uint8List? _currentAlbumArt;
+  bool _isDisposed = false;
 
   @override
   void initState() {
     super.initState();
+    _logger.i("Singlefilepicker init");
     _loadAudioFiles();
-    _setupPlayerListeners();
-    _audioService.addFileUpdateListener(_onFileUpdated);
+    _setupCompletionListener();
+    _audioService.addFileUpdateListener(_onParentFileUpdated);
+    _checkPermissions();
   }
 
   @override
   void dispose() {
-    _audioService.removeFileUpdateListener(_onFileUpdated);
-    _playerService.removePlaybackListener(_playbackListener);
-    _playerService.removePositionListener(_positionListener);
-    _playerService.removeDurationListener(_durationListener);
+    _isDisposed = true;
+    _removeCompletionListener();
+    _audioService.removeFileUpdateListener(_onParentFileUpdated);
     super.dispose();
   }
 
-  void _setupPlayerListeners() {
-    _playerService.addPlaybackListener(_playbackListener);
-    _playerService.addPositionListener(_positionListener);
-    _playerService.addDurationListener(_durationListener);
+  void _setupCompletionListener() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final playerState = Provider.of<PlayerStateService>(context, listen: false);
+      playerState.addCompletionListener(_onTrackCompletion);
+    });
   }
 
-  void _playbackListener(bool isPlaying) {
-    if (mounted) {
-      setState(() {
-        _isPlaying = isPlaying;
-      });
-    }
-  }
-
-  void _positionListener(Duration position) {
-    if (mounted) {
-      setState(() {
-        _position = position;
-      });
-    }
-  }
-
-  void _durationListener(Duration duration) {
-    if (mounted) {
-      setState(() {
-        _duration = duration;
-      });
-    }
-  }
-
-  void _onFileUpdated(String filePath) {
-    if (mounted) {
-      print("File updated: $filePath");
-      _refreshAllData(); 
-    }
-  }
-
-  Future<void> _refreshAllData() async {
-    await _loadAudioFiles(); 
-    
-    if (_currentPlayingFile != null) {
-      await _updateCurrentPlayingFileData();
-    }
-  }
-
-  Future<void> _updateCurrentPlayingFileData() async {
-    if (_currentPlayingFile == null) return;
-    
+  void _removeCompletionListener() {
     try {
-      final updatedFile = _audioFiles.firstWhere(
-        (file) => file.filePath == _currentPlayingFile!.filePath,
-        orElse: () => _currentPlayingFile!,
-      );
-      
-      final albumArt = await _audioService.getCover(_currentPlayingFile!.filePath);
-      
       if (mounted) {
-        setState(() {
-          _currentPlayingFile = updatedFile;
-          _currentAlbumArt = albumArt;
-        });
-        print("Current file data updated in mini player");
+        final playerState = Provider.of<PlayerStateService>(context, listen: false);
+        playerState.removeCompletionListener(_onTrackCompletion);
       }
     } catch (e) {
-      print("Error updating current file data: $e");
+      _logger.e("Error removing completion listener: $e");
+    }
+  }
+
+  void _onTrackCompletion() {
+    if (!mounted || _isDisposed) return;
+    
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && !_isDisposed && _audioFiles.isNotEmpty) {
+        _playNext();
+      }
+    });
+  }
+
+  void _onParentFileUpdated(String filePath) {
+    _logger.d("Parent file updated: $filePath");
+    if (!_isDisposed && mounted) {
+      _loadAudioFiles();
+    }
+  }
+
+  Future<void> _checkPermissions() async {
+    if (Platform.isAndroid) {
+      try {
+        final deviceInfo = await DeviceInfoPlugin().androidInfo;
+        if (deviceInfo.version.sdkInt >= 33) {
+          if (!await Permission.audio.isGranted) {
+            await Permission.audio.request();
+          }
+        } else {
+          if (!await Permission.storage.isGranted) {
+            await Permission.storage.request();
+          }
+        }
+      } catch (e) {
+        _logger.e("Error checking permissions: $e");
+      }
     }
   }
 
   Future<void> _loadAudioFiles() async {
-    if (!mounted) return;
+    if (!mounted || _isDisposed) return;
     
     try {
+      _logger.i("Loading audio files from database");
       final files = await _audioService.getAudioFiles();
+      
+      if (!mounted || _isDisposed) return;
+      
+      final validFiles = <AudioFileModel>[];
+      
+      for (final file in files) {
+        try {
+          final fileObj = File(file.filePath);
+          final exists = await fileObj.exists();
+          
+          if (exists) {
+            validFiles.add(file);
+          } else {
+            _logger.w("File not found: ${file.filePath}");
+            final markedFile = AudioFileModel(
+              id: file.id,
+              filePath: file.filePath,
+              fileName: file.fileName,
+              title: file.title != null ? "${file.title} (недоступен)" : "${file.fileName} (недоступен)",
+              artist: file.artist,
+              album: file.album,
+              genre: file.genre,
+              year: file.year,
+              trackNumber: file.trackNumber,
+              fileSize: file.fileSize,
+              fileExtension: file.fileExtension,
+              duration: file.duration,
+              dateAdded: file.dateAdded,
+            );
+            validFiles.add(markedFile);
+          }
+        } catch (e) {
+          _logger.e("Error checking file ${file.filePath}: $e");
+          validFiles.add(file);
+        }
+      }
+      
       if (mounted) {
         setState(() {
-          _audioFiles = files;
+          _audioFiles = validFiles;
           _isInitialized = true;
         });
       }
-      print("Loaded ${_audioFiles.length} audio files");
+      
+      _logger.i("Loaded ${validFiles.length} files");
+      
     } catch (e) {
-      print("Error loading audio files: $e");
-      if (mounted) {
-        setState(() {
-          _isInitialized = true;
-        });
-      }
-    }
-  }
-
-  Future<void> _loadCurrentFileData() async {
-    if (_currentPlayingFile == null) return;
-    
-    try {
-      final albumArt = await _audioService.getCover(_currentPlayingFile!.filePath);
-      if (mounted) {
-        setState(() {
-          _currentAlbumArt = albumArt;
-        });
-      }
-    } catch (e) {
-      print("Error loading current file data: $e");
+      _logger.e("Error loading audio files: $e");
+      if (!mounted || _isDisposed) return;
+      setState(() {
+        _isInitialized = true;
+      });
     }
   }
 
   Future<void> pickMultipleFiles() async {
+    _logger.i("Starting file picker");
+    
     setState(() {
       isLoading = true;
     });
@@ -158,26 +174,55 @@ class _SinglefilepickerState extends State<Singlefilepicker> {
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: true,
         type: FileType.audio,
+        withData: false,
+        allowCompression: false,
+        lockParentWindow: true,
       );
 
-      if (result != null) {
-        List<PlatformFile> newFiles = result.files;
+      if (result != null && result.files.isNotEmpty) {
+        _logger.i("Selected ${result.files.length} files");
         
-        newFiles = newFiles.where((file) {
-          final extension = file.extension?.toLowerCase();
-          return extension == 'mp3' || 
-                 extension == 'wav' || 
-                 extension == 'aac' || 
-                 extension == 'm4a' ||
-                 extension == 'ogg' ||
-                 extension == 'flac';
-        }).toList();
-
-        await _audioService.addFiles(newFiles);
-        await _refreshAllData();
+        final processedFiles = <PlatformFile>[];
+        
+        for (final file in result.files) {
+          if (file.path == null) continue;
+          
+          final extension = _getFileExtension(file.name);
+          if (!_isSupportedAudioFormat(extension)) continue;
+          
+          processedFiles.add(file);
+        }
+        
+        if (processedFiles.isNotEmpty) {
+          _logger.i("Adding ${processedFiles.length} files to database");
+          
+          await _audioService.addFiles(processedFiles);
+          
+          await _loadAudioFiles();
+          
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('Добавлено ${processedFiles.length} файлов'),
+                duration: Duration(seconds: 2),
+                backgroundColor: Colors.green,
+              ),
+            );
+          }
+        }
       }
     } catch (e) {
-      print("Error picking files: $e");
+      _logger.e("Error picking files: $e");
+      
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка выбора файлов: ${e.toString()}'),
+            duration: Duration(seconds: 5),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     } finally {
       if (mounted) {
         setState(() {
@@ -187,109 +232,145 @@ class _SinglefilepickerState extends State<Singlefilepicker> {
     }
   }
 
+  String _getFileExtension(String fileName) {
+    final ext = path.extension(fileName).toLowerCase();
+    return ext.startsWith('.') ? ext.substring(1) : ext;
+  }
+
+  bool _isSupportedAudioFormat(String extension) {
+    final supportedFormats = ['mp3', 'wav', 'aac', 'm4a', 'ogg', 'flac'];
+    return supportedFormats.contains(extension.toLowerCase());
+  }
+
   void playAudioFile(AudioFileModel audioFile) {
-    setState(() {
-      _currentPlayingFile = audioFile;
-      _currentAlbumArt = null; 
-    });
-    _playCurrentFile();
-    _loadCurrentFileData(); 
+    _logger.i("Playing audio file: ${audioFile.fileName}");
+    final playerState = Provider.of<PlayerStateService>(context, listen: false);
+    playerState.playAudioFile(audioFile);
   }
 
   void _handlePlayPauseFromList(AudioFileModel audioFile) {
-    final isCurrentFile = _currentPlayingFile?.filePath == audioFile.filePath;
+    final playerState = Provider.of<PlayerStateService>(context, listen: false);
+    final isCurrentFile = playerState.currentPlayingFile?.filePath == audioFile.filePath;
     
-    if (isCurrentFile && _isPlaying) {
-      _playerService.pause();
+    if (isCurrentFile && playerState.isPlaying) {
+      _logger.d("Pausing current file");
+      playerState.togglePlayPause();
     } else {
+      _logger.d("Playing new file");
       playAudioFile(audioFile);
     }
   }
 
-  void playAudioFileFullScreen(AudioFileModel audioFile) {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => SimpleExampleApp(audioFile: audioFile),
+  Future<void> removeFile(int index) async {
+    if (index < 0 || index >= _audioFiles.length) return;
+    
+    final audioFile = _audioFiles[index];
+    _logger.i("Removing file: ${audioFile.fileName}");
+    
+    final playerState = Provider.of<PlayerStateService>(context, listen: false);
+    final isCurrentPlaying = playerState.currentPlayingFile?.filePath == audioFile.filePath;
+    
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Удалить из библиотеки?'),
+        content: Text('Файл останется на устройстве, но будет удален из библиотеки приложения.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: Text('Отмена'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: Text('Удалить'),
+          ),
+        ],
       ),
-    ).then((_) {
-      _refreshAllData();
-    });
-  }
-
-  Future<void> _playCurrentFile() async {
-    if (_currentPlayingFile == null) return;
-
+    );
+    
+    if (shouldDelete != true) return;
+    
     try {
-      await _playerService.playAudioFile(_currentPlayingFile!);
-    } catch (e) {
-      print("Ошибка воспроизведения: $e");
+      if (isCurrentPlaying) {
+        await playerState.stop();
+      }
+      
+      await _audioService.removeFile(audioFile.filePath);
+      
+      await _loadAudioFiles();
+      
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Ошибка воспроизведения файла: $e')),
+          SnackBar(
+            content: Text('Файл удален из библиотеки'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+      
+    } catch (e) {
+      _logger.e("Error removing file: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка при удалении'),
+            backgroundColor: Colors.red,
+          ),
         );
       }
     }
   }
 
-  Future<void> _togglePlayPause() async {
-    if (_currentPlayingFile == null) {
-      if (_audioFiles.isNotEmpty) {
-        playAudioFile(_audioFiles.first);
+
+Future<void> editTags(AudioFileModel audioFile, int index) async {
+  _logger.i("Editing tags for: ${audioFile.fileName}");
+  
+  try {
+    final file = File(audioFile.filePath);
+    if (!await file.exists()) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Файл недоступен.'),
+            backgroundColor: Colors.orange,
+          ),
+        );
       }
       return;
     }
-
-    if (_isPlaying) {
-      await _playerService.pause();
-    } else {
-      await _playerService.resume();
-    }
-  }
-
-  Future<void> _playNext() async {
-    if (_audioFiles.isEmpty || _currentPlayingFile == null) return;
     
-    final currentIndex = _audioFiles.indexWhere((file) => file.filePath == _currentPlayingFile!.filePath);
-    if (currentIndex == -1) return;
-    
-    final nextIndex = (currentIndex + 1) % _audioFiles.length;
-    playAudioFile(_audioFiles[nextIndex]);
-  }
-
-  Future<void> _playPrevious() async {
-    if (_audioFiles.isEmpty || _currentPlayingFile == null) return;
-    
-    final currentIndex = _audioFiles.indexWhere((file) => file.filePath == _currentPlayingFile!.filePath);
-    if (currentIndex == -1) return;
-    
-    final prevIndex = currentIndex == 0 ? _audioFiles.length - 1 : currentIndex - 1;
-    playAudioFile(_audioFiles[prevIndex]);
-  }
-
-  void removeFile(int index) async {
-    final audioFile = _audioFiles[index];
-    
-    if (_currentPlayingFile?.filePath == audioFile.filePath) {
-      await _playerService.stop();
-      setState(() {
-        _currentPlayingFile = null;
-        _isPlaying = false;
-        _position = Duration.zero;
-        _duration = Duration.zero;
-        _currentAlbumArt = null;
-      });
+    if (Platform.isAndroid) {
+      bool hasPermission = false;
+      
+      if (await Permission.audio.isGranted) {
+        hasPermission = true;
+      } else {
+        final status = await Permission.audio.request();
+        hasPermission = status.isGranted;
+      }
+      
+      if (!hasPermission && await Permission.storage.isGranted) {
+        hasPermission = true;
+      }
+      
+      if (!hasPermission) {
+        _showPermissionWarning();
+        return;
+      }
     }
     
-    await _audioService.removeFile(audioFile.filePath);
-    await _refreshAllData();
-  }
-
-  Future<void> editTags(AudioFileModel audioFile, int index) async {
     final currentMetadata = await _audioService.getMetadata(audioFile.filePath);
     
-    if (currentMetadata == null) return;
-
+    if (currentMetadata == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Не удалось загрузить теги')),
+        );
+      }
+      return;
+    }
+    
     final result = await showDialog<bool>(
       context: context,
       builder: (context) => EditTagsDialog(
@@ -297,223 +378,333 @@ class _SinglefilepickerState extends State<Singlefilepicker> {
         filePath: audioFile.filePath,
       ),
     );
-
+    
     if (result == true) {
       await _audioService.refreshFileData(audioFile.filePath);
-      await _refreshAllData(); 
+      await _loadAudioFiles();
       
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Теги успешно обновлены!')),
+          SnackBar(
+            content: Text('Теги успешно обновлены!'),
+            backgroundColor: Colors.green,
+          ),
         );
       }
     }
-  }
-
-  String _formatDuration(Duration duration) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final minutes = duration.inMinutes.remainder(60);
-    final seconds = duration.inSeconds.remainder(60);
-    return '${twoDigits(minutes)}:${twoDigits(seconds)}';
-  }
-
-  String _getCurrentFileTitle() {
-    if (_currentPlayingFile == null) return '';
-    return _currentPlayingFile!.title ?? 
-           _currentPlayingFile!.fileName.replaceAll(
-             RegExp(r'\.(mp3|wav|aac|m4a|ogg|flac)$', caseSensitive: false), 
-             ''
-           );
-  }
-
-  String _getCurrentFileArtist() {
-    if (_currentPlayingFile == null) return '';
-    return _currentPlayingFile!.artist ?? 'Неизвестный исполнитель';
-  }
-
-  Widget _buildMiniPlayerAlbumArt() {
-    if (_currentAlbumArt != null) {
-      return ClipRRect(
-        borderRadius: BorderRadius.circular(4),
-        child: Image.memory(
-          _currentAlbumArt!,
-          width: 40,
-          height: 40,
-          fit: BoxFit.cover,
-          errorBuilder: (context, error, stackTrace) {
-            return _buildMiniPlayerPlaceholder();
-          },
+    
+  } catch (e) {
+    _logger.e("Error editing tags: $e");
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Ошибка при сохранении тегов'),
+          backgroundColor: Colors.red,
         ),
       );
     }
-    return _buildMiniPlayerPlaceholder();
   }
+}
 
-  Widget _buildMiniPlayerPlaceholder() {
-    return Container(
-      width: 40,
-      height: 40,
-      decoration: BoxDecoration(
-        color: Colors.grey.shade200,
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Icon(Icons.music_note, color: Colors.grey.shade600, size: 20),
-    );
-  }
-
-  Widget _buildMiniPlayer() {
-    if (_currentPlayingFile == null) {
-      return const SizedBox.shrink();
-    }
-
-    return Container(
-      height: 70,
-      decoration: BoxDecoration(
-        color: Colors.white,
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black12,
-            blurRadius: 4,
-            offset: Offset(0, -2),
+void _showPermissionWarning() {
+  showDialog(
+    context: context,
+    barrierDismissible: false,
+    builder: (context) => AlertDialog(
+      title: Text('Требуется разрешение'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.warning, size: 48, color: Colors.orange),
+          SizedBox(height: 16),
+          Text(
+            'Для редактирования тегов необходимо разрешение на доступ к файлам.',
+            textAlign: TextAlign.center,
+          ),
+          SizedBox(height: 8),
+          Text(
+            'Пожалуйста, предоставьте разрешение в настройках приложения.',
+            style: TextStyle(fontSize: 12, color: Colors.grey),
+            textAlign: TextAlign.center,
           ),
         ],
-        border: Border(top: BorderSide(color: Colors.grey.shade300)),
       ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: Text('Отмена'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            Navigator.pop(context);
+            openAppSettings();
+          },
+          style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
+          child: Text('Открыть настройки'),
+        ),
+      ],
+    ),
+  );
+}
+
+  Widget _buildMiniPlayer() {
+    return Consumer<PlayerStateService>(
+      builder: (context, playerState, child) {
+        if (playerState.currentPlayingFile == null) {
+          return const SizedBox.shrink();
+        }
+
+        return GestureDetector(
+          onTap: () => _openFullScreenPlayer(playerState),
+          child: Container(
+            height: 70,
+            decoration: BoxDecoration(
+              color: Colors.white,
+              boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4, offset: Offset(0, -2))],
+              border: Border(top: BorderSide(color: Colors.grey.shade300)),
+            ),
       child: Column(
-        children: [
-          LinearProgressIndicator(
-            value: _duration.inSeconds > 0 ? _position.inSeconds / _duration.inSeconds : 0,
-            backgroundColor: Colors.grey.shade200,
-            valueColor: AlwaysStoppedAnimation<Color>(Colors.green),
-            minHeight: 2,
-          ),
-          
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 8.0),
-              child: Row(
-                children: [
-                  _buildMiniPlayerAlbumArt(),
-                  
-                  SizedBox(width: 12),
-                  
-                  Expanded(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              LinearProgressIndicator(
+                value: playerState.duration.inSeconds > 0 
+                    ? playerState.position.inSeconds / playerState.duration.inSeconds 
+                    : 0,
+                backgroundColor: Colors.grey.shade200,
+                valueColor: AlwaysStoppedAnimation<Color>(Colors.green),
+                minHeight: 2,
+              ),
+                
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                    child: Row(
                       children: [
-                        Text(
-                          _getCurrentFileTitle(),
-                          style: TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w500,
+                        GestureDetector(
+                          onTap: () => _openFullScreenPlayer(playerState),
+                          child: Container(
+                            width: 40,
+                            height: 40,
+                            margin: EdgeInsets.only(right: 12),
+                            decoration: BoxDecoration(
+                              color: Colors.grey.shade200,
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: playerState.currentAlbumArt != null
+                                ? ClipRRect(
+                                    borderRadius: BorderRadius.circular(4),
+                                    child: Image.memory(
+                                      playerState.currentAlbumArt!,
+                                      fit: BoxFit.cover,
+                                      errorBuilder: (context, error, stackTrace) {
+                                        return _buildMiniPlayerPlaceholder();
+                                      },
+                                    ),
+                                  )
+                                : _buildMiniPlayerPlaceholder(),
                           ),
-                          overflow: TextOverflow.ellipsis,
-                          maxLines: 1,
                         ),
-                        SizedBox(height: 2),
-                        Text(
-                          _getCurrentFileArtist(),
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey.shade600,
+                        
+                        Expanded(
+                          child: GestureDetector(
+                            onTap: () => _openFullScreenPlayer(playerState),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  playerState.currentPlayingFile!.title ?? 
+                                  playerState.currentPlayingFile!.fileName.replaceAll(
+                                    RegExp(r'\.(mp3|wav|aac|m4a|ogg|flac)$', caseSensitive: false), 
+                                    ''
+                                  ),
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                  maxLines: 1,
+                                ),
+                                SizedBox(height: 2),
+                                Text(
+                                  playerState.currentPlayingFile!.artist ?? 'Неизвестный исполнитель',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.grey.shade600,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                  maxLines: 1,
+                                ),
+                              ],
+                            ),
                           ),
-                          overflow: TextOverflow.ellipsis,
-                          maxLines: 1,
+                        ),
+                        
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              icon: Icon(
+                                playerState.autoPlayNext ? Icons.repeat_one : Icons.repeat_one_outlined,
+                                size: 18,
+                              ),
+                              onPressed: _toggleAutoPlay,
+                              color: playerState.autoPlayNext ? Colors.green : Colors.grey.shade600,
+                              padding: EdgeInsets.all(4),
+                              constraints: BoxConstraints(minWidth: 32, minHeight: 32),
+                              tooltip: playerState.autoPlayNext ? 'Автовоспроизведение включено' : 'Автовоспроизведение выключено',
+                            ),
+                            
+                            IconButton(
+                              icon: Icon(Icons.skip_previous, size: 20),
+                              onPressed: _playPrevious,
+                              color: Colors.blue.shade600,
+                              padding: EdgeInsets.all(4),
+                              constraints: BoxConstraints(minWidth: 36, minHeight: 36),
+                            ),
+                            
+                            Container(
+                              width: 32,
+                              height: 32,
+                              decoration: BoxDecoration(
+                                color: Colors.green,
+                                shape: BoxShape.circle,
+                              ),
+                              child: IconButton(
+                                icon: Icon(
+                                  playerState.isPlaying ? Icons.pause : Icons.play_arrow,
+                                  size: 16,
+                                  color: Colors.white,
+                                ),
+                                onPressed: _togglePlayPause,
+                                padding: EdgeInsets.zero,
+                              ),
+                            ),
+                            
+                            IconButton(
+                              icon: Icon(Icons.skip_next, size: 20),
+                              onPressed: _playNext,
+                              color: Colors.blue.shade600,
+                              padding: EdgeInsets.all(4),
+                              constraints: BoxConstraints(minWidth: 36, minHeight: 36),
+                            ),
+                            
+                            SizedBox(width: 4),
+                            
+                            IconButton(
+                              icon: Icon(Icons.fullscreen, size: 18),
+                              onPressed: () => _openFullScreenPlayer(playerState),
+                              color: Colors.grey.shade600,
+                              padding: EdgeInsets.all(4),
+                              constraints: BoxConstraints(minWidth: 32, minHeight: 32),
+                              tooltip: 'Полноэкранный плеер',
+                            ),
+                          ],
                         ),
                       ],
                     ),
                   ),
-                  
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      IconButton(
-                        icon: Icon(Icons.skip_previous, size: 20),
-                        onPressed: _playPrevious,
-                        color: Colors.blue.shade600,
-                        padding: EdgeInsets.all(4),
-                        constraints: BoxConstraints(minWidth: 36, minHeight: 36),
-                      ),
-                      Container(
-                        width: 32,
-                        height: 32,
-                        decoration: BoxDecoration(
-                          color: Colors.green,
-                          shape: BoxShape.circle,
-                        ),
-                        child: IconButton(
-                          icon: Icon(
-                            _isPlaying ? Icons.pause : Icons.play_arrow,
-                            size: 16,
-                            color: Colors.white,
-                          ),
-                          onPressed: _togglePlayPause,
-                          padding: EdgeInsets.zero,
-                        ),
-                      ),
-                      IconButton(
-                        icon: Icon(Icons.skip_next, size: 20),
-                        onPressed: _playNext,
-                        color: Colors.blue.shade600,
-                        padding: EdgeInsets.all(4),
-                        constraints: BoxConstraints(minWidth: 36, minHeight: 36),
-                      ),
-                      SizedBox(width: 4),
-                      IconButton(
-                        icon: Icon(Icons.fullscreen, size: 18),
-                        onPressed: () => playAudioFileFullScreen(_currentPlayingFile!),
-                        color: Colors.grey.shade600,
-                        padding: EdgeInsets.all(4),
-                        constraints: BoxConstraints(minWidth: 32, minHeight: 32),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
-        ],
+        );
+      },
+    );
+  }
+
+  Widget _buildMiniPlayerPlaceholder() {
+    return Center(
+      child: Icon(
+        Icons.music_note, 
+        color: Colors.grey.shade600, 
+        size: 20
       ),
     );
   }
 
+  Future<void> _togglePlayPause() async {
+    final playerState = Provider.of<PlayerStateService>(context, listen: false);
+    await playerState.togglePlayPause();
+  }
+
+  void _toggleAutoPlay() {
+    final playerState = Provider.of<PlayerStateService>(context, listen: false);
+    final newValue = !playerState.autoPlayNext;
+    playerState.setAutoPlayNext(newValue);
+    
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(newValue ? 'Автовоспроизведение включено' : 'Автовоспроизведение выключено'),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _openFullScreenPlayer(PlayerStateService playerState) {
+    if (playerState.currentPlayingFile != null) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (context) => SimpleExampleApp(audioFile: playerState.currentPlayingFile!),
+        ),
+      );
+    }
+  }
+
+  Future<void> _playNext() async {
+    PlayerStateService? playerState;
+    try {
+      playerState = Provider.of<PlayerStateService>(context, listen: false);
+    } catch (e) {
+      _logger.e("Cannot access PlayerStateService: $e");
+      return;
+    }
+    
+    if (_audioFiles.isEmpty || playerState?.currentPlayingFile == null) return;
+    
+    final currentIndex = _audioFiles.indexWhere((file) => file.filePath == playerState!.currentPlayingFile!.filePath);
+    if (currentIndex == -1) return;
+    
+    final nextIndex = (currentIndex + 1) % _audioFiles.length;
+    playAudioFile(_audioFiles[nextIndex]);
+  }
+
+  Future<void> _playPrevious() async {
+    PlayerStateService? playerState;
+    try {
+      playerState = Provider.of<PlayerStateService>(context, listen: false);
+    } catch (e) {
+      _logger.e("Cannot access PlayerStateService: $e");
+      return;
+    }
+    
+    if (_audioFiles.isEmpty || playerState?.currentPlayingFile == null) return;
+    
+    final currentIndex = _audioFiles.indexWhere((file) => file.filePath == playerState!.currentPlayingFile!.filePath);
+    if (currentIndex == -1) return;
+    
+    final prevIndex = currentIndex == 0 ? _audioFiles.length - 1 : currentIndex - 1;
+    playAudioFile(_audioFiles[prevIndex]);
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        flexibleSpace: Container(
-          decoration: const BoxDecoration(
-            gradient: LinearGradient(
-              colors: [
-                Color.fromARGB(255, 49, 168, 215),
-                Color.fromARGB(255, 58, 207, 100)
-              ]
-            ),
-          ),
-        ),
-        title: const Text(
-          'Music Player',
-          style: TextStyle(
-            color: Color.fromARGB(255, 59, 54, 54),
-            fontWeight: FontWeight.bold,
-            fontSize: 25,
-          ),
-        ),
-      ),
+  return Scaffold(
+    appBar: AppBar(
+      title: Text('Музыкальный плеер'),
+      backgroundColor: const Color.fromARGB(255, 49, 168, 215),
+      elevation: 0,
+    ),
       body: Column(
         children: [
           Container(
             padding: EdgeInsets.all(16),
             child: ElevatedButton.icon(
               onPressed: isLoading ? null : pickMultipleFiles,
-              style: const ButtonStyle(
-                backgroundColor: WidgetStatePropertyAll(
-                  Color.fromARGB(255, 99, 198, 47)
-                ),
-                padding: WidgetStatePropertyAll(
-                  EdgeInsets.symmetric(vertical: 16, horizontal: 24)
-                ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Color.fromARGB(255, 99, 198, 47),
+                padding: EdgeInsets.symmetric(vertical: 16, horizontal: 24),
+                minimumSize: Size(double.infinity, 60),
               ),
               icon: isLoading 
                   ? SizedBox(
@@ -524,30 +715,61 @@ class _SinglefilepickerState extends State<Singlefilepicker> {
                         strokeWidth: 2,
                       ),
                     )
-                  : const Icon(Icons.audio_file),
+                  : Icon(Icons.audio_file, size: 24),
               label: isLoading
                   ? Text('Загрузка...', style: TextStyle(fontSize: 20))
-                  : Text('Выбрать аудио файлы', style: TextStyle(fontSize: 20)),
+                  : Text('Добавить музыку', style: TextStyle(fontSize: 20)),
             ),
           ),
           
+          if (_audioFiles.isNotEmpty)
+            Container(
+              padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              color: Colors.grey.shade50,
+              child: Row(
+                children: [
+                  Icon(Icons.info_outline, size: 16, color: Colors.blue),
+                  SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Редактируйте теги через контекстное меню файла',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey.shade700,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          
           Expanded(
             child: !_isInitialized 
-                ? Center(child: CircularProgressIndicator())
+                ? Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        CircularProgressIndicator(),
+                        SizedBox(height: 16),
+                        Text('Загрузка библиотеки...'),
+                      ],
+                    ),
+                  )
                 : _audioFiles.isEmpty
                     ? _buildEmptyState()
                     : ListView.builder(
                         itemCount: _audioFiles.length,
                         itemBuilder: (context, index) {
                           final audioFile = _audioFiles[index];
-                          final isCurrentPlaying = _currentPlayingFile?.filePath == audioFile.filePath;
+                          final playerState = Provider.of<PlayerStateService>(context);
+                          final isCurrentPlaying = playerState.currentPlayingFile?.filePath == audioFile.filePath;
                           
                           return AudioFileItem(
                             key: ValueKey('${audioFile.filePath}-$index'),
                             audioFile: audioFile,
                             audioService: _audioService,
                             isCurrentPlaying: isCurrentPlaying,
-                            isPlaying: _isPlaying && isCurrentPlaying,
+                            isPlaying: playerState.isPlaying && isCurrentPlaying,
                             onPlay: () => _handlePlayPauseFromList(audioFile),
                             onRemove: () => removeFile(index),
                             onEdit: () => editTags(audioFile, index),
@@ -564,30 +786,37 @@ class _SinglefilepickerState extends State<Singlefilepicker> {
 
   Widget _buildEmptyState() {
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(
-            Icons.music_note,
-            size: 64,
-            color: Colors.grey.shade400,
-          ),
-          SizedBox(height: 16),
-          Text(
-            'Нет загруженных аудио файлов',
-            style: TextStyle(
-              fontSize: 18,
-              color: Colors.grey.shade600,
+      child: Padding(
+        padding: const EdgeInsets.all(20.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              Icons.music_note_outlined,
+              size: 80,
+              color: Colors.grey.shade300,
             ),
-          ),
-          SizedBox(height: 8),
-          Text(
-            'Нажмите кнопку выше чтобы добавить музыку',
-            style: TextStyle(
-              color: Colors.grey.shade500,
+            SizedBox(height: 20),
+            Text(
+              'Ваша музыкальная библиотека пуста',
+              style: TextStyle(
+                fontSize: 20,
+                color: Colors.grey.shade600,
+                fontWeight: FontWeight.w500,
+              ),
+              textAlign: TextAlign.center,
             ),
-          ),
-        ],
+            SizedBox(height: 12),
+            Text(
+              'Нажмите кнопку "Добавить музыку" выше,\nчтобы начать добавлять треки в библиотеку',
+              style: TextStyle(
+                color: Colors.grey.shade500,
+                fontSize: 16,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -636,7 +865,7 @@ class _AudioFileItemState extends State<AudioFileItem> {
 
   void _onFileUpdated(String filePath) {
     if (filePath == widget.audioFile.filePath && mounted) {
-      _loadAlbumArt(); 
+      _loadAlbumArt();
     }
   }
 
@@ -668,11 +897,10 @@ class _AudioFileItemState extends State<AudioFileItem> {
 
   String getFileSize() {
     final bytes = widget.audioFile.fileSize;
-    final kb = bytes / 1024;
-    final mb = kb / 1024;
+    final mb = bytes / (1024 * 1024);
     return mb >= 1 
-        ? '${mb.toStringAsFixed(2)} MB'
-        : '${kb.toStringAsFixed(2)} KB';
+        ? '${mb.toStringAsFixed(1)} MB'
+        : '${(bytes / 1024).toStringAsFixed(0)} KB';
   }
 
   String getTitle() {
@@ -689,6 +917,15 @@ class _AudioFileItemState extends State<AudioFileItem> {
 
   String getAlbum() {
     return widget.audioFile.album ?? '';
+  }
+
+  String _formatDuration(int milliseconds) {
+    if (milliseconds <= 0) return '--:--';
+    
+    final duration = Duration(milliseconds: milliseconds);
+    final minutes = duration.inMinutes;
+    final seconds = duration.inSeconds.remainder(60);
+    return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
   }
 
   Widget _buildAlbumArt() {
@@ -805,11 +1042,13 @@ class _AudioFileItemState extends State<AudioFileItem> {
                 ),
               ),
             Text(
-              '${widget.audioFile.fileExtension.toUpperCase()} • ${getFileSize()}',
+              '${_formatDuration(widget.audioFile.duration)} • ${widget.audioFile.fileExtension.toUpperCase()} • ${getFileSize()}',
               style: TextStyle(
-                fontSize: 11, 
+                fontSize: 11,
                 color: widget.isCurrentPlaying ? Colors.green.shade400 : Colors.grey.shade500,
               ),
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
             ),
           ],
         ),
@@ -823,22 +1062,29 @@ class _AudioFileItemState extends State<AudioFileItem> {
                 size: 20,
               ),
             IconButton(
-              icon: Icon(Icons.edit, color: Colors.blue),
+              icon: Icon(Icons.edit, color: Colors.blue, size: 20),
               onPressed: widget.onEdit,
               tooltip: 'Редактировать теги',
+              padding: EdgeInsets.all(4),
+              constraints: BoxConstraints(minWidth: 36, minHeight: 36),
             ),
             IconButton(
               icon: Icon(
                 widget.isCurrentPlaying && widget.isPlaying ? Icons.pause : Icons.play_arrow, 
-                color: Colors.green
+                color: Colors.green,
+                size: 20,
               ),
               onPressed: widget.onPlay,
               tooltip: widget.isCurrentPlaying && widget.isPlaying ? 'Пауза' : 'Воспроизвести',
+              padding: EdgeInsets.all(4),
+              constraints: BoxConstraints(minWidth: 36, minHeight: 36),
             ),
             IconButton(
-              icon: Icon(Icons.delete, color: Colors.red),
+              icon: Icon(Icons.delete, color: Colors.red, size: 20),
               onPressed: widget.onRemove,
               tooltip: 'Удалить',
+              padding: EdgeInsets.all(4),
+              constraints: BoxConstraints(minWidth: 36, minHeight: 36),
             ),
           ],
         ),
